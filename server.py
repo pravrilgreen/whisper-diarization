@@ -156,7 +156,17 @@ class ClientSession:
                 msg = await self.audio_queue.get()
 
                 if isinstance(msg, bytes):
-                    await self.websocket.send(msg)  # Send binary: header + WAV
+                    header_len = struct.unpack("<I", msg[:4])[0]
+                    try:
+                        header_json = msg[4:4 + header_len].decode("utf-8", errors="ignore")
+                        header = json.loads(header_json)
+                        speaker = header.get("speaker", "unknown")
+                        text = header.get("text", "").strip()
+                        print(f"[SEND] speaker: {speaker} | text: {text}")
+                    except Exception:
+                        print("[SEND] ⚠️ Failed to parse header")
+
+                    await self.websocket.send(msg)
                 else:
                     print("[WARN] Skipped non-binary message.")
         except Exception as e:
