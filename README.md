@@ -37,7 +37,7 @@ cd whisper-diarization
 Create and activate a virtual environment:
 
 - **On Windows**:
-
+It might be because PowerShell's execution policy is blocking the script. You may need administrator privileges to change the policy and run the script.
 ```bash
 python -m venv venv
 .\venv\Scripts\activate
