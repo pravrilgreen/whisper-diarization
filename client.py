@@ -67,35 +67,41 @@ def send_audio(ws):
 def on_message(ws, message):
     try:
         if isinstance(message, bytes):
-            try:
-                message = message.decode("utf-8")
-            except UnicodeDecodeError:
-                print("[Client] ⚠️ Received non-UTF8 binary message. Skipping.")
+            if len(message) < 4:
+                print("[Client] ⚠️ Invalid binary message (too short).")
                 return
 
-        data = json.loads(message)
-        msg_type = data.get("type")
+            header_len = struct.unpack("<I", message[:4])[0]
+            header_json = message[4:4 + header_len].decode("utf-8")
+            header = json.loads(header_json)
 
-        if msg_type == "status" and data.get("ready"):
-            print("✅ Server is ready. Starting audio stream...")
-            ready_flag.set()
+            audio_bytes = message[4 + header_len:]
 
-        elif msg_type == "diarizedTranscript":
-            print("📜 Diarized Transcript:")
-            for seg in data.get("segments", []):
-                speaker = seg.get("speaker", "unknown")
-                text = seg.get("text", "")
-                print(f"🗣 [{speaker}] {text}")
+            speaker = header.get("speaker", "unknown")
+            text = header.get("text", "")
+
+            print(f"🗣 [{speaker}] {text}")
+
+            # timestamp = int(time.time() * 1000)
+            # filename = f"{timestamp}_{speaker}.wav"
+            # with open(filename, "wb") as f:
+            #     f.write(audio_bytes)
+            # print(f"💾 Saved audio: {filename}")
 
         else:
-            print(f"[Client] ❓ Unknown message type: {msg_type}")
+            # Chỉ còn xử lý status-type JSON (nếu có)
+            data = json.loads(message)
+            msg_type = data.get("type")
 
-    except json.JSONDecodeError as e:
-        print("[Client] ❌ JSON decode error:", e)
-        print("[Client] Raw message (truncated):", str(message)[:100])
+            if msg_type == "status" and data.get("ready"):
+                print("✅ Server is ready. Starting audio stream...")
+                ready_flag.set()
+
+            else:
+                print(f"[Client] ❓ Unknown message type: {msg_type}")
+
     except Exception as e:
-        print("[Client] ❌ Unexpected error:", e)
-
+        print("[Client] ❌ Error handling message:", e)
 
 def on_error(ws, error):
     print("❌ WebSocket error:", error)

@@ -1,13 +1,16 @@
 from multi_lang_whisper_manager import MultiLangWhisperQueueManager
-from pyannote.core import Segment, Annotation
 from pyannote.audio import Pipeline, Model, Inference
+from pyannote.core import Segment, Annotation
+from speaker_memory import SpeakerMemory
 from datetime import datetime
 from collections import deque
+import soundfile as sf
 import numpy as np
 import websockets
 import threading
 import webrtcvad
 import asyncio
+import struct
 import queue
 import torch
 import time
@@ -25,98 +28,6 @@ MIN_SILENCE_DURATION = 0.2
 
 DEVICE="cuda" if torch.cuda.is_available() else "cpu"
 global_whisper_manager = MultiLangWhisperQueueManager(device=DEVICE)
-
-class SpeakerMemory:
-    def __init__(self, path="speaker_memory.pt"):
-        self.speakers = {}
-        self.counter = 0
-        self.path = path
-        self._load()
-        print(f"[MEMORY] Total users in memory: {len(self.speakers)}")
-
-    def add_new_speaker(self, embedding, metadata=None):
-        embedding = embedding / np.linalg.norm(embedding)
-
-        for user_id, info in self.speakers.items():
-            for existing_embedding in info["embeddings"]:
-                existing_embedding = existing_embedding / np.linalg.norm(existing_embedding)
-                similarity = np.dot(embedding, existing_embedding)
-                if similarity > 0.3: 
-                    return None
-
-
-        user_id = f"User_{self.counter}"
-        self.counter += 1
-        self.speakers[user_id] = {
-            "embeddings": [embedding],
-            "metadata": metadata or {}
-        }
-        self._save()
-        print(f"[NEW SPEAKER] Added {user_id}")
-        return user_id
-
-
-    def identify_speaker(self, embedding, threshold=0.8):
-        embedding = embedding / np.linalg.norm(embedding)
-        best_match = None
-        best_score = -1.0
-
-        for user_id, info in self.speakers.items():
-            all_scores = []
-            for stored_embedding in info["embeddings"]:
-                stored_embedding = stored_embedding / np.linalg.norm(stored_embedding)
-                similarity = np.dot(embedding, stored_embedding)
-                all_scores.append(similarity)
-
-            if not all_scores:
-                continue
-
-            max_score = max(all_scores)
-            if max_score > best_score and max_score >= threshold:
-                best_score = max_score
-                best_match = user_id
-
-        return best_match
-
-    def update_embedding(self, user_id, new_embedding, max_memory=20):
-        new_embedding = new_embedding / np.linalg.norm(new_embedding)
-
-        if user_id in self.speakers:
-            for e in self.speakers[user_id]["embeddings"]:
-                e = e / np.linalg.norm(e)
-                similarity = np.dot(e, new_embedding)
-                if similarity > 0.99:
-                    return
-
-            if any(np.dot(e / np.linalg.norm(e), new_embedding) > 0.8 for e in self.speakers[user_id]["embeddings"]):
-                self.speakers[user_id]["embeddings"].append(new_embedding)
-                if len(self.speakers[user_id]["embeddings"]) > max_memory:
-                    self.speakers[user_id]["embeddings"] = self.speakers[user_id]["embeddings"][-max_memory:]
-                self._save()
-
-
-    def _save(self):
-        data = {
-            "counter": self.counter,
-            "speakers": {
-                user_id: {
-                    "embeddings": [e for e in info["embeddings"]],
-                    "metadata": info.get("metadata", {})
-                }
-                for user_id, info in self.speakers.items()
-            }
-        }
-        torch.save(data, self.path)
-
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                data = torch.load(self.path, weights_only = False)
-                self.counter = data.get("counter", 0)
-                self.speakers = data.get("speakers", {})
-                print(f"[LOAD] Loaded {len(self.speakers)} speakers.")
-            except Exception as e:
-                print(f"[LOAD ERROR] {e}")
 
 class ClientSession:
     def __init__(self, websocket):
@@ -243,9 +154,13 @@ class ClientSession:
         try:
             while not self.stop_flag.is_set():
                 msg = await self.audio_queue.get()
-                await self.websocket.send(msg)
-        except:
-            pass
+
+                if isinstance(msg, bytes):
+                    await self.websocket.send(msg)  # Send binary: header + WAV
+                else:
+                    print("[WARN] Skipped non-binary message.")
+        except Exception as e:
+            print(f"[ERROR] send_messages failed: {e}")
 
     def run_diarization(self, audio_bytes):
         wav_io = io.BytesIO()
@@ -459,18 +374,37 @@ class ClientSession:
                 speaker_mapping = self.process_diarization(diarization, audio_np, duration)
 
                 segments = self.transcribe_audio(audio_np)
-
                 results = self.assign_speakers_to_segments(segments, speaker_mapping)
 
-                if results:
-                    await self.audio_queue.put(json.dumps({
-                        "type": "diarizedTranscript",
-                        "segments": results,
-                    }))
+                results.sort(key=lambda x: x["start"])
+
+                for seg in results:
+                    seg_start = seg["start"]
+                    seg_end = seg["end"]
+                    speaker = seg["speaker"]
+                    text = seg["text"]
+
+                    start_sample = max(0, int(seg_start * 16000))
+                    end_sample = min(len(audio_np), int(seg_end * 16000))
+                    segment_audio = audio_np[start_sample:end_sample]
+
+                    with io.BytesIO() as buffer:
+                        sf.write(buffer, segment_audio, samplerate=16000, format="WAV")
+                        segment_wav_bytes = buffer.getvalue()
+
+                    header = {
+                        "speaker": speaker,
+                        "text": text,
+                    }
+                    header_json = json.dumps(header).encode("utf-8")
+                    header_len = struct.pack("<I", len(header_json))
+
+                    message = header_len + header_json + segment_wav_bytes
+
+                    await self.audio_queue.put(message)
 
             except Exception as e:
                 print(f"[CRITICAL] Error in process_audio_worker: {e}")
-
 
     async def receive_audio(self):
         try:
