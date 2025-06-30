@@ -7,7 +7,7 @@ from scipy.io import wavfile
 # === Config ===
 AUDIO_ROOT = "speaker_segments"
 OUTPUT_PT = "speaker_memory.pt"
-HF_TOKEN = "token"
+HF_TOKEN = os.getenv("HF_TOKEN")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MIN_DURATION = 1.0  # seconds
 EMBEDDING_SIMILARITY_THRESHOLD = 0.6

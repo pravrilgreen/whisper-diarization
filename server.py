@@ -1,9 +1,6 @@
-from pyannote.core import Segment, Timeline, Annotation
+from multi_lang_whisper_manager import MultiLangWhisperQueueManager
+from pyannote.core import Segment, Annotation
 from pyannote.audio import Pipeline, Model, Inference
-from scipy.signal import butter, lfilter
-from faster_whisper import WhisperModel
-from scipy.signal import resample_poly
-import torch.nn.functional as F
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -20,39 +17,18 @@ import os
 import io
 
 # ======================= CONFIG ============================
-WHISPER_MODEL = "medium"
-HF_TOKEN = "token"
+HF_TOKEN = os.getenv("HF_TOKEN")
 VAD_MODE = 1
 SILERO_THRESHOLD = 0.8
 MIN_SILENCE_DURATION = 0.2
-DEVICE="cuda" if torch.cuda.is_available() else "cpu"
 # ===========================================================
 
-BLOCKED_KEYWORDS = [
-    "Hãy subscribe cho kênh", "Ghiền Mì Gõ", "ご視聴ありがとうございました",
-    "ではまた次の動画でお会いしましょう", "Cảm ơn các bạn.", "Chúc các bạn đừng quên đăng ký",
-    "Hẹn gặp lại ở video tiếp theo", "Cảm ơn các bạn đã theo dõi và hẹn gặp lại.",
-    "Các bạn có thể nhìn thấy những bức ảnh của tôi trong video này."
-]
-
-def convert_audio(pcm_bytes, orig_sr, target_sr=16000, dtype='int16', channels=1, orig_dtype='int16'):
-    audio = np.frombuffer(pcm_bytes, dtype=orig_dtype)
-    if channels > 1:
-        audio = audio.reshape(-1, channels)[:, 0]
-    if orig_dtype == 'float32':
-        audio = np.clip(audio, -1.0, 1.0)
-        audio = (audio * 32767).astype(np.int16)
-    if orig_sr != target_sr:
-        audio = resample_poly(audio, target_sr, orig_sr).astype(np.int16)
-    return audio.tobytes()
-
-def is_overlapped(segment: Segment, annotation) -> bool:
-    active = list(annotation.get_labels(segment))
-    return len(active) > 1
+DEVICE="cuda" if torch.cuda.is_available() else "cpu"
+global_whisper_manager = MultiLangWhisperQueueManager(device=DEVICE)
 
 class SpeakerMemory:
     def __init__(self, path="speaker_memory.pt"):
-        self.speakers = {}  # {user_id: {"embeddings": [...], "metadata": {...}}}
+        self.speakers = {}
         self.counter = 0
         self.path = path
         self._load()
@@ -66,7 +42,6 @@ class SpeakerMemory:
                 existing_embedding = existing_embedding / np.linalg.norm(existing_embedding)
                 similarity = np.dot(embedding, existing_embedding)
                 if similarity > 0.3: 
-                    #print(f"[REJECT] Embedding quá giống với {user_id} (score: {similarity:.4f})")
                     return None
 
 
@@ -77,7 +52,7 @@ class SpeakerMemory:
             "metadata": metadata or {}
         }
         self._save()
-        print(f"[NEW SPEAKER] Đã thêm {user_id}")
+        print(f"[NEW SPEAKER] Added {user_id}")
         return user_id
 
 
@@ -136,13 +111,12 @@ class SpeakerMemory:
     def _load(self):
         if os.path.exists(self.path):
             try:
-                data = torch.load(self.path)
+                data = torch.load(self.path, weights_only = False)
                 self.counter = data.get("counter", 0)
                 self.speakers = data.get("speakers", {})
                 print(f"[LOAD] Loaded {len(self.speakers)} speakers.")
             except Exception as e:
                 print(f"[LOAD ERROR] {e}")
-
 
 class ClientSession:
     def __init__(self, websocket):
@@ -167,7 +141,7 @@ class ClientSession:
         self.is_webrtc_speech_active = False
         self.is_silero_speech_active = False
 
-        self.session_speaker_map = {}  # map SPEAKER_XX → User_X persistently
+        self.session_speaker_map = {}
         self.speaker_memory = SpeakerMemory(path="speaker_memory.pt")
 
         self.embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token=HF_TOKEN)
@@ -181,11 +155,9 @@ class ClientSession:
         )
         self.diarization_pipeline.to(torch.device(DEVICE))
 
-        self.whisper_model = WhisperModel(
-            model_size_or_path=WHISPER_MODEL,
-            device=DEVICE,
-            compute_type="float16" if torch.cuda.is_available() else "int8"
-        )
+        self.whisper_model = global_whisper_manager
+        self._transcribe_result = None
+        self._event = threading.Event()
 
         self.silero_queue = queue.Queue()
         self.silero_thread = threading.Thread(target=self._silero_worker, daemon=True)
@@ -409,7 +381,8 @@ class ClientSession:
 
                 if matched_user_id != "unknown_user":
                     num_embeddings = len(self.speaker_memory.speakers[matched_user_id]["embeddings"])
-                    is_overlap = is_overlapped(segment, diarization)
+                    active = list(diarization.get_labels(segment))
+                    is_overlap = len(active) > 1
                     update_allowed = (seg_duration >= 4.0 or num_embeddings < 3) and not is_overlap
 
                     if update_allowed:
@@ -428,19 +401,17 @@ class ClientSession:
 
         return speaker_mapping
 
-
     def transcribe_audio(self, audio_np):
-        segments, _ = self.whisper_model.transcribe(
+        segments = self.whisper_model.transcribe(
             audio_np,
-            language=self.language or "vi",
-            beam_size=5,
-            vad_filter=True,
-            word_timestamps=True
+            language=self.language,
         )
+        segments = list(segments)
         return segments
     
-    def assign_speakers_to_segments(self, segments, diarization, speaker_mapping):
+    def assign_speakers_to_segments(self, segments, speaker_mapping):
         results = []
+        segments = list(segments)
 
         annotation = Annotation()
         for (start, end), speaker in speaker_mapping.items():
@@ -448,9 +419,6 @@ class ClientSession:
 
         for segment in segments:
             seg_text = segment.text.strip()
-            if not seg_text or any(k in seg_text for k in BLOCKED_KEYWORDS):
-                continue
-
             seg_start, seg_end = segment.start, segment.end
             seg = Segment(seg_start, seg_end)
 
@@ -472,19 +440,10 @@ class ClientSession:
                 "start": seg_start,
                 "end": seg_end,
                 "text": seg_text,
-                "speaker": speaker,
-                "words": [
-                    {
-                        "start": w.start,
-                        "end": w.end,
-                        "word": w.word,
-                        "probability": w.probability
-                    } for w in segment.words
-                ] if hasattr(segment, "words") else []
+                "speaker": speaker
             })
 
         return results
-
 
     async def process_audio_worker(self):
         while not self.stop_flag.is_set():
@@ -500,7 +459,8 @@ class ClientSession:
                 speaker_mapping = self.process_diarization(diarization, audio_np, duration)
 
                 segments = self.transcribe_audio(audio_np)
-                results = self.assign_speakers_to_segments(segments, diarization, speaker_mapping)
+
+                results = self.assign_speakers_to_segments(segments, speaker_mapping)
 
                 if results:
                     await self.audio_queue.put(json.dumps({
@@ -577,3 +537,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("❌ Server stopped manually.")
+ 

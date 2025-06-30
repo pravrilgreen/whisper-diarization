@@ -1,0 +1,7 @@
+faster-whisper
+torch
+pyannote.audio
+pyannote.core
+numpy
+websockets
+webrtcvad

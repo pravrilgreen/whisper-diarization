@@ -14,7 +14,7 @@ LANGS = ["en", "vi", "ja"]
 SRC_LANG_IDX = 0
 SRC_LANG = LANGS[SRC_LANG_IDX]
 TGT_LANG = "en"
-USER = "TuanLM12-en"
+USER = "client-test"
 # =====================================================
 
 # Flags
@@ -39,7 +39,7 @@ def send_audio(ws):
             "sampleRate": SAMPLE_RATE,
             "dtype": "int16",
             "channels": 1,
-            "language": src_lang_value,  # khớp với server field
+            "language": src_lang_value,
             "user": USER
         }
 
@@ -127,7 +127,7 @@ def on_open(ws):
 
 def input_listener():
     global SRC_LANG_IDX, SRC_LANG
-    print("👉 Nhấn 'n' rồi Enter để chuyển SRC_LANG (en <-> vi <-> ja)")
+    print("👉 Press 'n' then Enter to switch SRC_LANG (en <-> vi <-> ja)")
     while not stop_flag.is_set():
         cmd = input()
         if cmd.strip().lower() == 'n':
