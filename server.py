@@ -51,6 +51,9 @@ class ClientSession:
         self.silero_buffer = bytearray()
         self.is_webrtc_speech_active = False
         self.is_silero_speech_active = False
+        self.state = "IDLE"
+        self.speech_started_at = None
+        self.silence_started_at = None
 
         self.session_speaker_map = {}
         self.speaker_memory = SpeakerMemory(path="speaker_memory.pt")
@@ -133,22 +136,33 @@ class ClientSession:
     def _is_voice_active(self):
         return self.is_webrtc_speech_active and self.is_silero_speech_active
 
-    def _save_speaker_audio(self, audio_array, speaker_id, start, end):
+    def _save_speaker_audio(self, audio_input, speaker_id="unknown_user"):
         folder = "speaker_segments"
         os.makedirs(folder, exist_ok=True)
 
-        timestamp = f"{start:.2f}-{end:.2f}".replace(".", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = os.path.join(folder, f"{speaker_id}_{timestamp}.wav")
 
-        audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
+        if isinstance(audio_input, bytes):
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_input)
 
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio_int16.tobytes())
+        elif isinstance(audio_input, np.ndarray):
+            audio_int16 = (np.clip(audio_input, -1.0, 1.0) * 32767).astype(np.int16)
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(audio_int16.tobytes())
+        else:
+            print(f"[ERROR] _save_speaker_audio received unsupported input type: {type(audio_input)}")
+            return
 
         print(f"[AUDIO] Saved segment for {speaker_id}: {filename}")
+
 
     async def send_messages(self):
         try:
@@ -192,7 +206,7 @@ class ClientSession:
             print(f"[ERROR] Diarization failed: {e}")
             return None
 
-    def process_diarization(self, diarization, audio_np, duration):
+    def process_diarization(self, diarization, audio_np, audio_bytes, duration):
         speaker_mapping = {}
         if not diarization:
             return speaker_mapping
@@ -247,9 +261,14 @@ class ClientSession:
                 # if seg_duration < 1.0 or len(segment_audio) < 2400:
                 #     continue
 
-                waveform_tensor = torch.tensor(audio_np, dtype=torch.float32).unsqueeze(0)
+                start_sample = int(segment.start * 16000)
+                end_sample = int(segment.end * 16000)
+                segment_bytes = audio_bytes[start_sample * 2:end_sample * 2]
+                segment_np = np.frombuffer(segment_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                waveform_tensor = torch.tensor(segment_np, dtype=torch.float32).unsqueeze(0)
                 input_dict = {"waveform": waveform_tensor, "sample_rate": 16000}
-                embedding_np = self.inference.crop(input_dict, segment)
+                embedding_np = self.inference(input_dict)
                 embedding = embedding_np / np.linalg.norm(embedding_np)
                 if embedding is None or not isinstance(embedding, np.ndarray):
                     continue
@@ -284,24 +303,24 @@ class ClientSession:
                 if seg_duration >= 3.0:
                     if best_score >= 0.8:
                         matched_user_id = best_user
-                        print(f"[RECOGNITION] {matched_user_id} matched (score: {best_score:.4f})")
+                        #print(f"[RECOGNITION] {matched_user_id} matched (score: {best_score:.4f})")
                     else:
                         matched_user_id = self.speaker_memory.add_new_speaker(embedding)
                         if matched_user_id:
                             print(f"[ADD] New user added: {matched_user_id}")
                         else:
-                            print(f"[RECOGNITION] Rejected, too similar to {best_user} (score: {best_score:.4f})")
+                            #print(f"[RECOGNITION] Rejected, too similar to {best_user} (score: {best_score:.4f})")
                             matched_user_id = best_user if best_user else "unknown_user"
                 else:
                     if best_score >= 0.8:
                         matched_user_id = best_user
-                        print(f"[RECOGNITION] {matched_user_id} matched (score: {best_score:.4f})")
+                        #print(f"[RECOGNITION] {matched_user_id} matched (score: {best_score:.4f})")
                     else:
                         if best_user:
-                            print(f"[RECOGNITION] Closest match: {best_user} (score: {best_score:.4f})")
+                            #print(f"[RECOGNITION] Closest match: {best_user} (score: {best_score:.4f})")
                             matched_user_id = best_user
                         else:
-                            print(f"[RECOGNITION] Unknown speaker — no users in memory")
+                            #print(f"[RECOGNITION] Unknown speaker — no users in memory")
                             matched_user_id = "unknown_user"
 
                 if matched_user_id != "unknown_user":
@@ -313,13 +332,13 @@ class ClientSession:
                     if update_allowed:
                         self.speaker_memory.update_embedding(matched_user_id, embedding)
                         total = len(self.speaker_memory.speakers[matched_user_id]["embeddings"])
-                        print(f"[UPDATE] {matched_user_id} updated → total embeddings: {total}")
+                        #print(f"[UPDATE] {matched_user_id} updated → total embeddings: {total}")
                     else:
                         print(f"[SKIP] No update for {matched_user_id} (embeddings: {num_embeddings})")
 
                 speaker_mapping[(segment.start, segment.end)] = matched_user_id
-                #self._save_speaker_audio(segment_audio, speaker_id=matched_user_id, start=segment.start, end=segment.end)
-                #print(f"[SAVE] Segment saved → {matched_user_id} [{segment.start:.2f}–{segment.end:.2f}]")
+                self._save_speaker_audio(segment_audio, speaker_id=matched_user_id)
+                print(f"[SAVE] Segment saved → {matched_user_id} [{segment.start:.2f}–{segment.end:.2f}]")
 
             except Exception:
                 continue
@@ -374,14 +393,13 @@ class ClientSession:
         while not self.stop_flag.is_set():
             try:
                 audio_bytes = await self.inference_queue.get()
-
                 audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                 duration = len(audio_np) / 16000.0
 
                 print(f"[INFO] Processing {duration:.2f} seconds of audio...")
 
                 diarization = self.run_diarization(audio_bytes)
-                speaker_mapping = self.process_diarization(diarization, audio_np, duration)
+                speaker_mapping = self.process_diarization(diarization, audio_np, audio_bytes, duration)
 
                 segments = self.transcribe_audio(audio_np)
                 results = self.assign_speakers_to_segments(segments, speaker_mapping)
@@ -424,44 +442,82 @@ class ClientSession:
                     header = json.loads(message[4:4 + hdr_len].decode("utf-8"))
                     pcm16k = message[4 + hdr_len:]
 
+                    # Update language if changed
                     language = header.get("language")
                     if language and language != self.language:
-                        print(f"[LANG] Language changed → {self.language} → {language}")
+                        ts = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                        print(f"[{ts}] [LANG] Language changed → {self.language} → {language}")
                         self.language = language
 
+                    # VAD buffer
                     self.vad_buffer.extend(pcm16k)
-
                     while len(self.vad_buffer) >= 960:
                         frame = bytes(self.vad_buffer[:960])
                         self.vad_buffer = self.vad_buffer[960:]
                         self._check_voice_activity(frame)
 
-                    self.pre_buffer.extend(pcm16k)
                     now = time.time()
+                    voice_active = self._is_voice_active()
 
-                    if self._is_voice_active():
-                        self.last_voice_time = now
-                        if not self.audio_buffer:
+                    if self.state == "IDLE":
+                        if voice_active:
+                            self.state = "PREPARE"
+                            self.speech_started_at = now
                             self.audio_buffer.extend(self.pre_buffer)
-                            self.pre_buffer.clear()
-                        self.audio_buffer.extend(pcm16k)
-                    else:
-                        if now - self.last_voice_time < MIN_SILENCE_DURATION:
                             self.audio_buffer.extend(pcm16k)
-                        elif len(self.audio_buffer) > 0:
-                            await self.inference_queue.put(bytes(self.audio_buffer))
+                            self.pre_buffer.clear()
+                        else:
+                            self.pre_buffer.extend(pcm16k)
+
+                    elif self.state == "PREPARE":
+                        if voice_active:
+                            self.state = "SPEAKING"
+                            self.audio_buffer.extend(pcm16k)
+                        elif now - self.speech_started_at > 0.3:  # Allow up to 300ms for voice to kick in
+                            self.state = "IDLE"
+                            self.audio_buffer.clear()
+                            self.pre_buffer.extend(pcm16k)
+                        else:
+                            self.audio_buffer.extend(pcm16k)  # Continue buffering during grace period
+
+                    elif self.state == "SPEAKING":
+                        if voice_active:
+                            self.audio_buffer.extend(pcm16k)
+                        else:
+                            self.state = "ENDING"
+                            self.silence_started_at = now
+                            self.audio_buffer.extend(pcm16k)
+
+                    elif self.state == "ENDING":
+                        if voice_active:
+                            self.state = "SPEAKING"
+                            self.audio_buffer.extend(pcm16k)
+                            self.silence_started_at = None
+                        elif now - self.silence_started_at > MIN_SILENCE_DURATION:
+                            # Finalize and send with padding
+                            self.audio_buffer.extend(pcm16k)  # Add final tail
+                            if self.audio_buffer:
+                                await self.inference_queue.put(bytes(self.audio_buffer))
+                                print(f"[DEBUG] Audio pushed to inference_queue, length: {len(self.audio_buffer) / 32000:.2f}s")
                             self.audio_buffer.clear()
                             self.pre_buffer.clear()
-        except:
-            pass
+                            self.state = "IDLE"
+                        else:
+                            self.audio_buffer.extend(pcm16k)
+
+        except Exception as e:
+            print(f"[ERROR] receive_audio: {e}")
 
     async def run(self):
+        client_ip = self.websocket.remote_address[0] if self.websocket.remote_address else "unknown"
+        print(f"[CONNECT] Client connected from {client_ip}")
         await self.websocket.send(json.dumps({"type": "status", "ready": True}))
         sender = asyncio.create_task(self.send_messages())
         receiver = asyncio.create_task(self.receive_audio())
         processor = asyncio.create_task(self.process_audio_worker())
 
         done, pending = await asyncio.wait([sender, receiver, processor], return_when=asyncio.FIRST_COMPLETED)
+        print(f"[DISCONNECT] Client {client_ip} disconnected.")
         self.stop_flag.set()
         for task in pending:
             task.cancel()

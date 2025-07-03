@@ -11,9 +11,10 @@ class TranscribeTask:
         self.result_callback = result_callback
 
 class MultiLangWhisperQueueManager:
-    def __init__(self, device="cuda"):
+    def __init__(self, device=None):
         self.device = device
         self.task_queues = {}
+        print("Initzitazing model with ", device)
         self.models = {
             "en": WhisperModel(
                 model_size_or_path="medium.en",
